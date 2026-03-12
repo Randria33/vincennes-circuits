@@ -8,14 +8,28 @@ import io
 
 app = Flask(__name__)
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
-CSV_FILE   = os.path.join(BASE_DIR, 'circuits_vincennes.csv')
-CACHE_FILE = os.path.join(BASE_DIR, 'geocache.json')
+BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
+# Sur Render, les données mutables vont sur le disque persistant /data
+# En local, elles restent à côté de app.py
+DATA_DIR  = '/data' if os.path.isdir('/data') else BASE_DIR
+
+CSV_FILE      = os.path.join(DATA_DIR, 'circuits_vincennes.csv')
+CACHE_FILE    = os.path.join(DATA_DIR, 'geocache.json')
+CIRCUITS_FILE = os.path.join(DATA_DIR, 'circuits_config.json')
+EXTRACTION_FILE = os.path.join(DATA_DIR, 'extraction_colissimo.txt')
 
 FUSION = {'542': '542', '543': '542'}   # 542 et 543 = même secteur → "542"
 
-CIRCUITS_FILE    = os.path.join(BASE_DIR, 'circuits_config.json')
-EXTRACTION_FILE  = os.path.join(os.path.dirname(BASE_DIR), 'extraction_colissimo.txt')
+def _init_data():
+    """Copie les fichiers initiaux dans DATA_DIR si absents (premier démarrage sur Render)."""
+    for fname in ('circuits_vincennes.csv', 'geocache.json', 'circuits_config.json'):
+        src = os.path.join(BASE_DIR, fname)
+        dst = os.path.join(DATA_DIR, fname)
+        if not os.path.exists(dst) and os.path.exists(src):
+            import shutil
+            shutil.copy2(src, dst)
+
+_init_data()
 
 def mark_in_extraction(rue, circuit, tag):
     """Ajoute un tag [SUPPRIMÉ] ou [MODIFIÉ ...] sur les lignes correspondantes dans extraction_colissimo.txt."""
