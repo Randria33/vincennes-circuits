@@ -983,6 +983,21 @@ function buildPopupContent(m) {
           📏 Min→Max
         </button>
       </div>
+      <div id="add-circuit-inline-${popupId}" style="margin-top:6px;">
+        <div style="display:flex;gap:5px;">
+          <select id="add-circ-sel-${popupId}"
+            style="flex:1;padding:5px;border-radius:5px;border:1px solid #0f3460;
+                   background:#0a0a1a;color:#fff;font-size:11px;">
+            ${allCircuits.map(c =>
+              `<option value="${c}" style="background:${COLORS[c]||'#444'}" ${c===m.circuit?'selected':''}>${c}${c===m.circuit?' (actuel)':''}</option>`).join('')}
+          </select>
+          <button onclick="addRueToCircuit('${rueEnc}','${rueCircEnc}','add-circ-sel-${popupId}')"
+            style="padding:5px 10px;background:#16a085;color:#fff;border:none;
+                   border-radius:5px;cursor:pointer;font-weight:bold;font-size:11px;">
+            ＋ Circuit
+          </button>
+        </div>
+      </div>
       <button onclick="deleteRueFromPopup('${rueEnc}','${rueCircEnc}')"
         style="width:100%;margin-top:6px;padding:6px;background:#c0392b;color:#fff;
                border:none;border-radius:5px;cursor:pointer;font-weight:bold;font-size:12px;">
@@ -1316,6 +1331,29 @@ async function saveNumsFromPopup(rueEnc, circuitEnc, inputId) {
   redrawMap();
   buildList(allMarkers);
   showToast(`✅ Numéros de "${rue}" mis à jour`);
+}
+
+async function addRueToCircuit(rueEnc, circuitEnc, selId) {
+  const rue        = decodeURIComponent(rueEnc);
+  const oldCircuit = decodeURIComponent(circuitEnc);
+  const newCircuit = document.getElementById(selId).value;
+  if (!newCircuit) return;
+
+  // Récupérer le district depuis le marker existant
+  const existing = allMarkers.find(m => m.rue === rue && m.circuit === oldCircuit);
+  const district  = existing && existing.districts.length ? existing.districts[0] : 'd 1';
+  const numeros   = existing ? existing.numeros : '';
+
+  const res = await fetch('/api/add_rue', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ rue, circuit: newCircuit, district, numeros })
+  });
+  const d = await res.json();
+  map.closePopup();
+  if (d.error) { showToast('❌ ' + d.error); return; }
+  allMarkers = d.markers;
+  redrawMap(); buildList(allMarkers);
+  showToast(`✅ "${rue}" ajouté au circuit ${newCircuit}`);
 }
 
 async function deleteRueFromPopup(rueEnc, circuitEnc) {
