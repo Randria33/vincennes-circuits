@@ -1,8 +1,8 @@
 """
-Application Flask - Gestion interactive des circuits Vincennes (polyline map)
+Application Flask - Gestion interactive des circuits Vincennes (tracé manuel)
 """
 from flask import Flask, jsonify, request, render_template_string, Response
-import json, os, re, csv, io
+import json, os, re, csv, io, math, time
 import requests as http_requests
 from collections import defaultdict
 
@@ -11,9 +11,8 @@ app = Flask(__name__)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = '/data' if os.path.isdir('/data') else BASE_DIR
 
-SEGMENTS_FILE     = os.path.join(DATA_DIR, 'segments.json')
-CIRCUITS_FILE     = os.path.join(DATA_DIR, 'circuits_config.json')
-STREETS_CACHE     = os.path.join(DATA_DIR, 'streets_cache.json')
+SEGMENTS_FILE = os.path.join(DATA_DIR, 'segments.json')
+CIRCUITS_FILE = os.path.join(DATA_DIR, 'circuits_config.json')
 
 DEFAULT_COLORS = {
     '541': '#e74c3c',
@@ -25,27 +24,17 @@ DEFAULT_COLORS = {
     '548': '#0f178a',
 }
 DEFAULT_CIRCUITS = ['541', '542', '544', '545', '546', '547', '548']
-
 OVERPASS_URL = 'https://overpass-api.de/api/interpreter'
-OVERPASS_QUERY = """
-[out:json][timeout:30];
-area["name"="Vincennes"]["boundary"="administrative"]["admin_level"="8"]->.v;
-way["highway"~"residential|primary|secondary|tertiary|unclassified|living_street|pedestrian|service"]["name"](area.v);
-out geom;
-"""
 
-# ─── Init data ────────────────────────────────────────────────────────────────
+# ─── Init ─────────────────────────────────────────────────────────────────────
 
 def _init_data():
-    """Copy initial files into DATA_DIR on first start (Render), create blanks if needed."""
     import shutil
     for fname in ('circuits_config.json',):
         src = os.path.join(BASE_DIR, fname)
         dst = os.path.join(DATA_DIR, fname)
         if not os.path.exists(dst) and os.path.exists(src):
             shutil.copy2(src, dst)
-
-    # segments.json — start empty if missing
     if not os.path.exists(SEGMENTS_FILE):
         with open(SEGMENTS_FILE, 'w', encoding='utf-8') as f:
             json.dump({}, f)
@@ -74,42 +63,31 @@ def save_circuits_config(cfg):
     with open(CIRCUITS_FILE, 'w', encoding='utf-8') as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-def load_streets_cache():
-    if os.path.exists(STREETS_CACHE):
-        with open(STREETS_CACHE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
+def point_to_segment_dist(px, py, ax, ay, bx, by):
+    """Distance in meters from point to segment (approximate, flat earth)."""
+    lat_m = 111320.0
+    lon_m = 111320.0 * math.cos(math.radians((ax + bx) / 2.0))
+    dx = (bx - ax) * lon_m
+    dy = (by - ay) * lat_m
+    if dx == 0 and dy == 0:
+        return math.hypot((px - ax) * lon_m, (py - ay) * lat_m)
+    t = ((px - ax) * lon_m * dx + (py - ay) * lat_m * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    nx = ax + t * (bx - ax)
+    ny = ay + t * (by - ay)
+    return math.hypot((px - nx) * lon_m, (py - ny) * lat_m)
 
-def save_streets_cache(data):
-    with open(STREETS_CACHE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-def fetch_streets_from_overpass():
-    """Query Overpass API and return { street_name: [[lat,lon],...], ... }"""
-    try:
-        resp = http_requests.post(
-            OVERPASS_URL,
-            data={'data': OVERPASS_QUERY},
-            timeout=45
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as e:
-        return None, str(e)
-
-    streets = defaultdict(list)
-    for element in data.get('elements', []):
-        if element.get('type') != 'way':
-            continue
-        name = element.get('tags', {}).get('name', '').strip()
-        if not name:
-            continue
-        geometry = element.get('geometry', [])
-        coords = [[pt['lat'], pt['lon']] for pt in geometry if 'lat' in pt and 'lon' in pt]
-        if coords:
-            streets[name.lower()].extend(coords)
-
-    return dict(streets), None
+def is_near_polyline(lat, lon, coords, max_dist=50):
+    if len(coords) == 1:
+        c = coords[0]
+        lat_m = 111320.0
+        lon_m = 111320.0 * math.cos(math.radians(c[0]))
+        return math.hypot((lat - c[0]) * lat_m, (lon - c[1]) * lon_m) <= max_dist
+    for i in range(len(coords) - 1):
+        if point_to_segment_dist(lat, lon, coords[i][0], coords[i][1],
+                                  coords[i+1][0], coords[i+1][1]) <= max_dist:
+            return True
+    return False
 
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
@@ -127,69 +105,150 @@ def api_data():
         'colors': cfg.get('colors', DEFAULT_COLORS),
     })
 
-@app.route('/api/streets')
-def api_streets():
-    force = request.args.get('force', '0') == '1'
-    cache = load_streets_cache()
-    if cache and not force:
-        return jsonify({'streets': cache, 'source': 'cache'})
+@app.route('/api/detect_addresses', methods=['POST'])
+def api_detect_addresses():
+    body = request.get_json(force=True)
+    coords = body.get('coordinates', [])
+    if not coords:
+        return jsonify({'addresses': [], 'street_name': '', 'count': 0})
 
-    streets, error = fetch_streets_from_overpass()
-    if error:
-        # Return cache if available, even on error
-        if cache:
-            return jsonify({'streets': cache, 'source': 'cache', 'warning': error})
-        return jsonify({'error': error, 'streets': {}}), 500
+    lats = [c[0] for c in coords]
+    lons = [c[1] for c in coords]
+    pad = 0.001
+    s, w, n, e = min(lats)-pad, min(lons)-pad, max(lats)+pad, max(lons)+pad
 
-    save_streets_cache(streets)
-    return jsonify({'streets': streets, 'source': 'overpass'})
+    # In France, addresses are often on building ways (not nodes) → include both
+    # 'out center' gives lat/lon centroid for ways too
+    query = f"""[out:json][timeout:25];
+(
+  node["addr:housenumber"]({s},{w},{n},{e});
+  way["addr:housenumber"]({s},{w},{n},{e});
+  way["highway"]["name"]({s},{w},{n},{e});
+);
+out center;"""
+
+    try:
+        resp = http_requests.post(OVERPASS_URL, data={'data': query}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as ex:
+        return jsonify({'addresses': [], 'street_name': '', 'count': 0, 'error': str(ex)})
+
+    addresses = []
+    street_votes = {}
+
+    for el in data.get('elements', []):
+        t = el.get('type')
+        tags = el.get('tags', {})
+
+        # Get lat/lon: nodes have them directly, ways have a 'center' object
+        if t == 'node':
+            lat = el.get('lat')
+            lon = el.get('lon')
+        elif t == 'way':
+            center = el.get('center', {})
+            lat = center.get('lat')
+            lon = center.get('lon')
+        else:
+            continue
+
+        num = tags.get('addr:housenumber', '').strip()
+        street = tags.get('addr:street', '').strip()
+        highway_name = tags.get('name', '').strip()
+
+        if num and lat is not None and lon is not None:
+            if is_near_polyline(lat, lon, coords, 60):
+                addresses.append({'housenumber': num, 'street': street, 'lat': lat, 'lon': lon})
+                if street:
+                    street_votes[street] = street_votes.get(street, 0) + 1
+
+        elif highway_name and t == 'way' and lat is not None:
+            # Way is a street → vote for street name
+            if is_near_polyline(lat, lon, coords, 80):
+                street_votes[highway_name] = street_votes.get(highway_name, 0) + 1
+
+    # Sort house numbers naturally
+    def hn_sort(a):
+        m = re.match(r'^(\d+)', a['housenumber'])
+        return int(m.group(1)) if m else 9999
+
+    addresses.sort(key=hn_sort)
+
+    street_name = max(street_votes, key=street_votes.get) if street_votes else ''
+
+    return jsonify({
+        'addresses': addresses,
+        'street_name': street_name,
+        'count': len(addresses),
+    })
 
 @app.route('/api/assign', methods=['POST'])
 def api_assign():
     body = request.get_json(force=True)
-    rue = body.get('rue', '').strip().lower()
+    key = body.get('key', '').strip()
     circuit = str(body.get('circuit', '')).strip()
+    street_name = body.get('street_name', '').strip()
     nb_colis = body.get('nb_colis', None)
-    if not rue or not circuit:
-        return jsonify({'error': 'rue and circuit required'}), 400
+    coordinates = body.get('coordinates', [])
+    house_numbers = body.get('house_numbers', [])
+
+    if not circuit:
+        return jsonify({'error': 'circuit required'}), 400
+
     segments = load_segments()
-    entry = {'circuit': circuit}
+    entry = {
+        'circuit': circuit,
+        'street_name': street_name,
+        'coordinates': coordinates,
+        'house_numbers': house_numbers,
+    }
     if nb_colis is not None and nb_colis != '':
         try:
             entry['nb_colis'] = int(nb_colis)
         except (ValueError, TypeError):
             pass
-    segments[rue] = entry
+
+    if not key:
+        key = str(int(time.time() * 1000))
+
+    segments[key] = entry
     save_segments(segments)
-    return jsonify({'segments': segments})
+    return jsonify({'segments': segments, 'key': key})
 
 @app.route('/api/unassign', methods=['POST'])
 def api_unassign():
     body = request.get_json(force=True)
-    rue = body.get('rue', '').strip().lower()
-    if not rue:
-        return jsonify({'error': 'rue required'}), 400
+    key = body.get('key', '').strip()
+    if not key:
+        return jsonify({'error': 'key required'}), 400
     segments = load_segments()
-    segments.pop(rue, None)
+    segments.pop(key, None)
     save_segments(segments)
     return jsonify({'segments': segments})
 
 @app.route('/api/export_circuit/<circuit>')
 def api_export_circuit(circuit):
     segments = load_segments()
-    lines = [f"Circuit {circuit} - Export\n{'='*40}"]
-    total = 0
-    for rue, info in sorted(segments.items()):
-        if info.get('circuit') == circuit:
-            nb = info.get('nb_colis', '')
-            nb_str = f"  ({nb} colis)" if nb else ''
-            lines.append(f"{rue}{nb_str}")
-            if nb:
-                total += int(nb)
-    lines.append(f"\n{'='*40}")
-    lines.append(f"Total rues : {sum(1 for r,i in segments.items() if i.get('circuit')==circuit)}")
-    if total:
-        lines.append(f"Total colis : {total}")
+    lines = [f"Circuit {circuit} - Export", '='*40]
+    total_colis = 0
+    nb_segs = 0
+    for key, info in sorted(segments.items(), key=lambda x: x[1].get('street_name', '')):
+        if info.get('circuit') != circuit:
+            continue
+        nb_segs += 1
+        street = info.get('street_name', key)
+        nb = info.get('nb_colis', '')
+        hn = info.get('house_numbers', [])
+        line = f"{street or key}"
+        if hn:
+            line += f"  [N°: {', '.join(hn)}]"
+        if nb:
+            line += f"  ({nb} colis)"
+            total_colis += int(nb)
+        lines.append(line)
+    lines += ['', '='*40,
+              f"Total segments : {nb_segs}",
+              f"Total colis estimés : {total_colis}"]
     content = '\n'.join(lines)
     return Response(
         content,
@@ -200,16 +259,14 @@ def api_export_circuit(circuit):
 @app.route('/api/import_csv', methods=['POST'])
 def api_import_csv():
     if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
+        return jsonify({'error': 'No file'}), 400
     f = request.files['file']
     content = f.read().decode('utf-8-sig', errors='replace')
     reader = csv.DictReader(io.StringIO(content), delimiter=';')
     segments = load_segments()
     imported = 0
-    errors = []
     for row in reader:
         try:
-            # Try common column names
             circuit = ''
             rue = ''
             nb_colis = None
@@ -218,22 +275,23 @@ def api_import_csv():
                 if kl in ('C', 'CIRCUIT'):
                     circuit = str(v).strip()
                 elif kl in ('RUE', 'STREET', 'VOIE', 'NOM_RUE'):
-                    rue = str(v).strip().lower()
+                    rue = str(v).strip()
                 elif kl in ('NB_COLIS', 'COLIS', 'NOMBRE_COLIS'):
                     try:
                         nb_colis = int(v)
                     except (ValueError, TypeError):
                         pass
             if rue and circuit:
-                entry = {'circuit': circuit}
+                key = str(int(time.time() * 1000)) + str(imported)
+                entry = {'circuit': circuit, 'street_name': rue, 'coordinates': [], 'house_numbers': []}
                 if nb_colis is not None:
                     entry['nb_colis'] = nb_colis
-                segments[rue] = entry
+                segments[key] = entry
                 imported += 1
-        except Exception as e:
-            errors.append(str(e))
+        except Exception:
+            pass
     save_segments(segments)
-    return jsonify({'imported': imported, 'errors': errors, 'segments': segments})
+    return jsonify({'imported': imported, 'segments': segments})
 
 @app.route('/api/add_circuit', methods=['POST'])
 def api_add_circuit():
@@ -259,9 +317,8 @@ def api_delete_circuit():
     cfg['circuits'] = [c for c in cfg.get('circuits', []) if c != name]
     cfg.get('colors', {}).pop(name, None)
     save_circuits_config(cfg)
-    # Also remove segments assigned to this circuit
     segments = load_segments()
-    segments = {r: i for r, i in segments.items() if i.get('circuit') != name}
+    segments = {k: v for k, v in segments.items() if v.get('circuit') != name}
     save_segments(segments)
     return jsonify(cfg)
 
@@ -277,7 +334,7 @@ def api_update_color():
     save_circuits_config(cfg)
     return jsonify(cfg)
 
-# ─── HTML Page ────────────────────────────────────────────────────────────────
+# ─── HTML ─────────────────────────────────────────────────────────────────────
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="fr">
@@ -288,291 +345,181 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-  :root {
-    --bg: #1a1a2e;
-    --bg2: #16213e;
-    --bg3: #0f3460;
-    --accent: #e94560;
-    --text: #eaeaea;
-    --text2: #aaa;
-    --border: #2a2a4a;
-    --sidebar-w: 360px;
-  }
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-  html, body { height: 100%; overflow: hidden; font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); }
+:root {
+  --bg:     #1e2130;
+  --bg2:    #252840;
+  --bg3:    #1a1c2e;
+  --accent: #4f8ef7;
+  --text:   #e8eaf0;
+  --text2:  #8890a8;
+  --border: #333655;
+  --sw:     340px;
+  --danger: #e74c3c;
+  --success:#27ae60;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:'Segoe UI',sans-serif;background:var(--bg);color:var(--text)}
+#app{display:flex;height:100vh}
 
-  #app { display: flex; height: 100vh; }
+/* ── Sidebar ── */
+#sidebar{width:var(--sw);min-width:var(--sw);background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden;z-index:10}
+#sb-head{padding:12px 14px 10px;border-bottom:1px solid var(--border);background:var(--bg3)}
+#sb-head h1{font-size:15px;font-weight:700;color:var(--accent)}
+#sb-stats{font-size:11px;color:var(--text2);margin-top:3px}
+#sb-search{padding:8px 12px;border-bottom:1px solid var(--border)}
+#search-input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-size:13px;outline:none}
+#search-input:focus{border-color:var(--accent)}
+#circuit-filters{padding:8px 12px;border-bottom:1px solid var(--border);display:flex;flex-wrap:wrap;gap:5px;align-items:center}
+.filter-btn{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:5px;border:none;cursor:pointer;font-size:12px;font-weight:700;transition:opacity .2s}
+.filter-btn.off{opacity:.3}
+.filter-btn .lbl{pointer-events:none}
+.filter-btn .ico{font-size:10px;cursor:pointer}
+.filter-btn .ico:hover{opacity:.7}
+#add-circuit-btn{padding:3px 9px;border-radius:5px;border:1px dashed var(--border);background:transparent;color:var(--text2);cursor:pointer;font-size:12px}
+#add-circuit-btn:hover{border-color:var(--accent);color:var(--text)}
+#street-list{flex:1;overflow-y:auto;padding:4px 0}
+#street-list::-webkit-scrollbar{width:4px}
+#street-list::-webkit-scrollbar-track{background:var(--bg2)}
+#street-list::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.seg-item{display:flex;align-items:center;gap:7px;padding:6px 12px;cursor:pointer;border-left:3px solid transparent;transition:background .12s;font-size:13px}
+.seg-item:hover{background:rgba(255,255,255,.04)}
+.seg-badge{font-size:10px;font-weight:700;padding:2px 5px;border-radius:3px;white-space:nowrap}
+.seg-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.seg-meta{font-size:11px;color:var(--text2);white-space:nowrap}
+#export-row{padding:8px 12px;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:4px;align-items:center}
+#export-row .row-lbl{font-size:10px;color:var(--text2);width:100%;margin-bottom:2px}
+.exp-btn{padding:5px 9px;border:none;border-radius:4px;cursor:pointer;font-weight:700;font-size:11px}
+.act-btn{padding:5px 9px;border-radius:4px;border:1px solid var(--border);background:var(--bg);color:var(--text);cursor:pointer;font-size:11px}
+.act-btn:hover{border-color:var(--accent)}
 
-  /* ── Sidebar ── */
-  #sidebar {
-    width: var(--sidebar-w);
-    min-width: var(--sidebar-w);
-    background: var(--bg2);
-    border-right: 1px solid var(--border);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    z-index: 10;
-  }
-  #sidebar-header {
-    padding: 14px 16px 10px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg3);
-  }
-  #sidebar-header h1 { font-size: 16px; font-weight: 700; }
-  #stats { font-size: 12px; color: var(--text2); margin-top: 4px; }
+/* ── Map wrapper ── */
+#map-wrap{flex:1;position:relative;overflow:hidden}
+#map{width:100%;height:100%}
 
-  #sidebar-search {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-  }
-  #search-input {
-    width: 100%;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    color: var(--text);
-    padding: 7px 10px;
-    font-size: 13px;
-    outline: none;
-  }
-  #search-input:focus { border-color: var(--accent); }
+/* ── Map toolbar ── */
+#map-toolbar{
+  position:absolute;top:12px;left:50%;transform:translateX(-50%);
+  z-index:500;
+  display:flex;gap:6px;
+  background:rgba(255,255,255,.93);
+  border-radius:8px;
+  padding:6px 10px;
+  box-shadow:0 2px 12px rgba(0,0,0,.2);
+}
+#map-toolbar button{
+  padding:6px 14px;border-radius:6px;border:none;cursor:pointer;
+  font-size:13px;font-weight:600;transition:background .15s;
+}
+#btn-draw{background:#4f8ef7;color:#fff}
+#btn-draw:hover{background:#2e70e0}
+#btn-draw.active{background:#f59e0b;color:#fff}
+#btn-finish{background:var(--success);color:#fff;display:none}
+#btn-finish:hover{filter:brightness(1.1)}
+#btn-cancel-draw{background:#e5e7eb;color:#333;display:none}
+#btn-cancel-draw:hover{background:#d1d5db}
+#draw-hint{
+  position:absolute;bottom:30px;left:50%;transform:translateX(-50%);
+  z-index:500;
+  background:rgba(0,0,0,.7);color:#fff;
+  padding:7px 14px;border-radius:20px;
+  font-size:12px;display:none;pointer-events:none;
+}
 
-  #circuit-filters {
-    padding: 10px 12px;
-    border-bottom: 1px solid var(--border);
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-    align-items: center;
-  }
-  .filter-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 8px;
-    border-radius: 5px;
-    border: none;
-    cursor: pointer;
-    font-size: 12px;
-    font-weight: 600;
-    color: #000;
-    transition: opacity 0.2s;
-  }
-  .filter-btn.inactive { opacity: 0.3; }
-  .filter-btn .color-dot {
-    width: 10px; height: 10px; border-radius: 50%;
-    background: currentColor;
-    cursor: pointer;
-    position: relative;
-  }
-  .filter-btn .del-btn {
-    margin-left: 2px;
-    font-size: 10px;
-    opacity: 0.7;
-    cursor: pointer;
-  }
-  .filter-btn .del-btn:hover { opacity: 1; color: #e00; }
-  #add-circuit-btn {
-    padding: 4px 10px;
-    border-radius: 5px;
-    border: 1px dashed var(--border);
-    background: transparent;
-    color: var(--text2);
-    cursor: pointer;
-    font-size: 12px;
-  }
-  #add-circuit-btn:hover { border-color: var(--accent); color: var(--text); }
+/* ── Modal ── */
+#modal-overlay{
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);
+  z-index:9000;align-items:center;justify-content:center;
+}
+#modal-overlay.show{display:flex}
+#modal-box{
+  background:var(--bg2);border:1px solid var(--border);
+  border-radius:10px;padding:20px;width:340px;max-height:90vh;
+  overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.5);
+}
+#modal-box h3{font-size:15px;font-weight:700;margin-bottom:14px;color:var(--accent)}
+.m-label{font-size:11px;color:var(--text2);display:block;margin-bottom:3px;margin-top:10px}
+.m-input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:5px;color:var(--text);padding:7px 9px;font-size:13px;outline:none}
+.m-input:focus{border-color:var(--accent)}
+#modal-hn-list{
+  max-height:120px;overflow-y:auto;background:var(--bg);border:1px solid var(--border);
+  border-radius:5px;padding:6px 8px;font-size:12px;color:var(--text2);
+  display:flex;flex-wrap:wrap;gap:4px;
+}
+.hn-tag{
+  background:var(--bg3);border:1px solid var(--border);border-radius:3px;
+  padding:2px 6px;font-size:11px;color:var(--text);
+}
+#modal-count{font-size:11px;color:var(--text2);margin-top:4px}
+.modal-btns{display:flex;gap:8px;margin-top:16px}
+#modal-save{flex:1;padding:9px;background:var(--accent);border:none;border-radius:6px;color:#fff;font-weight:700;cursor:pointer;font-size:13px}
+#modal-save:hover{filter:brightness(1.1)}
+#modal-delete{padding:9px 12px;background:#333;border:1px solid #555;border-radius:6px;color:#aaa;cursor:pointer;font-size:13px}
+#modal-delete:hover{border-color:var(--danger);color:var(--danger)}
+#modal-cancel{padding:9px 12px;background:transparent;border:1px solid var(--border);border-radius:6px;color:var(--text2);cursor:pointer;font-size:13px}
+#modal-cancel:hover{border-color:var(--text)}
+#modal-loading{text-align:center;padding:10px;color:var(--text2);font-size:12px}
 
-  #street-list {
-    flex: 1;
-    overflow-y: auto;
-    padding: 6px 0;
-  }
-  #street-list::-webkit-scrollbar { width: 5px; }
-  #street-list::-webkit-scrollbar-track { background: var(--bg2); }
-  #street-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-
-  .street-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 7px 14px;
-    cursor: pointer;
-    border-left: 3px solid transparent;
-    transition: background 0.15s;
-    font-size: 13px;
-  }
-  .street-item:hover { background: rgba(255,255,255,0.05); }
-  .street-item .circuit-badge {
-    font-size: 10px;
-    font-weight: 700;
-    padding: 2px 5px;
-    border-radius: 3px;
-    color: #000;
-    white-space: nowrap;
-  }
-  .street-item .rue-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .street-item .nb-colis { font-size: 11px; color: var(--text2); white-space: nowrap; }
-
-  #export-row {
-    padding: 10px 12px;
-    border-top: 1px solid var(--border);
-    display: flex;
-    flex-wrap: wrap;
-    gap: 5px;
-    align-items: center;
-  }
-  #export-row label { font-size: 11px; color: var(--text2); width: 100%; margin-bottom: 2px; }
-  .circuit-export-btn {
-    padding: 6px 10px;
-    border: none;
-    border-radius: 5px;
-    cursor: pointer;
-    font-weight: bold;
-    font-size: 11px;
-    color: #000;
-    margin: 2px;
-  }
-  #import-btn {
-    padding: 6px 10px;
-    border-radius: 5px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--text);
-    cursor: pointer;
-    font-size: 11px;
-  }
-  #import-btn:hover { border-color: var(--accent); }
-  #refresh-streets-btn {
-    padding: 6px 10px;
-    border-radius: 5px;
-    border: 1px solid var(--border);
-    background: var(--bg);
-    color: var(--text);
-    cursor: pointer;
-    font-size: 11px;
-  }
-  #refresh-streets-btn:hover { border-color: #27ae60; }
-
-  /* ── Map ── */
-  #map { flex: 1; height: 100vh; }
-
-  /* ── Loading overlay ── */
-  #loading {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0,0,0,0.65);
-    z-index: 9999;
-    align-items: center;
-    justify-content: center;
-    flex-direction: column;
-    gap: 14px;
-    font-size: 16px;
-  }
-  #loading.show { display: flex; }
-  .spinner {
-    width: 40px; height: 40px;
-    border: 4px solid rgba(255,255,255,0.2);
-    border-top-color: var(--accent);
-    border-radius: 50%;
-    animation: spin 0.8s linear infinite;
-  }
-  @keyframes spin { to { transform: rotate(360deg); } }
-
-  /* ── Popup ── */
-  .leaflet-popup-content-wrapper {
-    background: var(--bg2) !important;
-    color: var(--text) !important;
-    border: 1px solid var(--border) !important;
-    border-radius: 8px !important;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.5) !important;
-  }
-  .leaflet-popup-tip { background: var(--bg2) !important; }
-  .leaflet-popup-content { margin: 0 !important; padding: 0 !important; }
-  .street-popup { padding: 14px 16px; min-width: 240px; }
-  .street-popup h3 { font-size: 14px; margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 8px; text-transform: capitalize; }
-  .street-popup label { font-size: 12px; color: var(--text2); display: block; margin-bottom: 3px; margin-top: 8px; }
-  .street-popup select, .street-popup input[type=number] {
-    width: 100%;
-    background: var(--bg);
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    color: var(--text);
-    padding: 6px 8px;
-    font-size: 13px;
-    outline: none;
-  }
-  .street-popup select:focus, .street-popup input:focus { border-color: var(--accent); }
-  .popup-btns { display: flex; gap: 8px; margin-top: 12px; }
-  .btn-assign {
-    flex: 1;
-    padding: 8px;
-    background: var(--accent);
-    border: none;
-    border-radius: 5px;
-    color: #fff;
-    font-weight: 600;
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .btn-assign:hover { filter: brightness(1.15); }
-  .btn-unassign {
-    padding: 8px 12px;
-    background: #333;
-    border: 1px solid #555;
-    border-radius: 5px;
-    color: var(--text2);
-    cursor: pointer;
-    font-size: 13px;
-  }
-  .btn-unassign:hover { border-color: #e00; color: #e00; }
-
-  /* ── Color picker hidden input ── */
-  input[type=color].hidden-picker {
-    position: absolute;
-    width: 0; height: 0;
-    opacity: 0;
-    pointer-events: none;
-  }
+/* ── Leaflet overrides ── */
+.leaflet-popup-content-wrapper{background:#fff!important;color:#222!important;border-radius:7px!important;box-shadow:0 4px 16px rgba(0,0,0,.2)!important}
+.leaflet-popup-tip{background:#fff!important}
+.addr-marker-icon{
+  width:8px!important;height:8px!important;
+  border-radius:50%;border:2px solid #fff;
+  box-shadow:0 1px 3px rgba(0,0,0,.3);
+}
 </style>
 </head>
 <body>
-<div id="loading"><div class="spinner"></div><span id="loading-msg">Chargement…</span></div>
 <input type="file" id="csv-file-input" accept=".csv,.txt" style="display:none"/>
+
+<!-- Segment edit/create modal -->
+<div id="modal-overlay">
+  <div id="modal-box">
+    <h3 id="modal-title">Nouveau segment</h3>
+    <span class="m-label">Rue</span>
+    <input class="m-input" id="modal-street" type="text" placeholder="Nom de la rue…"/>
+    <span class="m-label">Numéros détectés</span>
+    <div id="modal-hn-list"><em style="color:var(--text2)">—</em></div>
+    <div id="modal-count"></div>
+    <span class="m-label">Circuit</span>
+    <select class="m-input" id="modal-circuit"></select>
+    <span class="m-label">Nb colis estimé</span>
+    <input class="m-input" id="modal-nb" type="number" min="0" placeholder="0"/>
+    <div id="modal-loading" style="display:none">⏳ Détection des adresses…</div>
+    <div class="modal-btns">
+      <button id="modal-save">✓ Enregistrer</button>
+      <button id="modal-delete" style="display:none">🗑 Supprimer</button>
+      <button id="modal-cancel">Annuler</button>
+    </div>
+  </div>
+</div>
 
 <div id="app">
   <!-- Sidebar -->
   <div id="sidebar">
-    <div id="sidebar-header">
-      <h1>🗺 Circuits Vincennes</h1>
-      <div id="stats">Chargement…</div>
+    <div id="sb-head">
+      <h1>Circuits Vincennes</h1>
+      <div id="sb-stats">Chargement…</div>
     </div>
-
-    <div id="sidebar-search">
-      <input id="search-input" type="text" placeholder="🔍 Rechercher une rue assignée…"/>
-    </div>
-
-    <div id="circuit-filters">
-      <!-- filled by JS -->
-      <button id="add-circuit-btn">＋ Nouveau circuit</button>
-    </div>
-
-    <div id="street-list">
-      <!-- filled by JS -->
-    </div>
-
+    <div id="sb-search"><input id="search-input" type="text" placeholder="🔍 Rechercher…"/></div>
+    <div id="circuit-filters"><button id="add-circuit-btn">＋ Nouveau circuit</button></div>
+    <div id="street-list"></div>
     <div id="export-row">
-      <label>Exporter un circuit :</label>
-      <!-- filled by JS -->
-      <button id="refresh-streets-btn" title="Recharger les rues depuis OpenStreetMap">🔄 Actualiser les rues</button>
-      <button id="import-btn" title="Importer un ancien CSV">⬆ Importer CSV</button>
+      <span class="row-lbl">Exporter :</span>
+      <button class="act-btn" id="import-btn">⬆ Importer CSV</button>
     </div>
   </div>
 
   <!-- Map -->
-  <div id="map"></div>
+  <div id="map-wrap">
+    <div id="map"></div>
+    <div id="map-toolbar">
+      <button id="btn-draw">✏ Tracer un segment</button>
+      <button id="btn-finish">✓ Terminer le tracé</button>
+      <button id="btn-cancel-draw">✕ Annuler</button>
+    </div>
+    <div id="draw-hint">Cliquez pour placer des points · Double-clic ou "Terminer" pour finir</div>
+  </div>
 </div>
 
 <script>
@@ -580,497 +527,452 @@ HTML_PAGE = r"""<!DOCTYPE html>
 let segments = {};
 let circuits  = [];
 let colors    = {};
-let streets   = {};       // { "rue daumesnil": [[lat,lon],...] }
 let visibleCircuits = new Set();
 
-// Leaflet layer groups
 let map;
-let layerUnassigned;  // L.layerGroup
-let layerAssigned;    // L.layerGroup
-let polylineMap = {};  // { streetName: L.polyline }
-let activePopup = null;
-let highlightedPolyline = null;
+let segmentLayers = {};   // key → { pline, addrMarkers[] }
 
-// ─── Utility ──────────────────────────────────────────────────────────────────
-function showLoading(msg='Chargement…') {
-  document.getElementById('loading-msg').textContent = msg;
-  document.getElementById('loading').classList.add('show');
-}
-function hideLoading() {
-  document.getElementById('loading').classList.remove('show');
-}
+// Drawing state
+let drawMode = false;
+let drawPoints = [];      // [{lat,lon}]
+let drawPolyline = null;  // L.polyline in progress
+let drawDotMarkers = [];  // L.circleMarker for each point
 
-function capitalize(s) {
-  return s.replace(/\b\w/g, c => c.toUpperCase());
-}
+// Modal state
+let modalMode = null;     // 'create' | 'edit'
+let modalKey  = null;
+let modalCoords = [];
+let modalAddresses = [];
 
-function getColor(circuit) {
-  return colors[circuit] || '#888';
+// ─── Utils ────────────────────────────────────────────────────────────────────
+function getColor(c){ return colors[c] || '#888' }
+function contrastColor(hex){
+  const r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);
+  return (r*299+g*587+b*114)/1000>150?'#000':'#fff';
 }
+function capitalize(s){ return s.replace(/\b\w/g,c=>c.toUpperCase()) }
 
-function contrastColor(hex) {
-  // Return black or white for text contrast
-  const r = parseInt(hex.slice(1,3),16);
-  const g = parseInt(hex.slice(3,5),16);
-  const b = parseInt(hex.slice(5,7),16);
-  return (r*299+g*587+b*114)/1000 > 128 ? '#000' : '#fff';
-}
-
-// ─── Map init ─────────────────────────────────────────────────────────────────
-function initMap() {
-  map = L.map('map', { center: [48.8472, 2.4388], zoom: 14 });
-  L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
-    maxZoom: 19
+// ─── Map ──────────────────────────────────────────────────────────────────────
+function initMap(){
+  map = L.map('map',{center:[48.8472,2.4388],zoom:15,doubleClickZoom:false});
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',{
+    attribution:'&copy; OpenStreetMap &copy; CARTO',maxZoom:20
   }).addTo(map);
 
-  layerUnassigned = L.layerGroup().addTo(map);
-  layerAssigned   = L.layerGroup().addTo(map);
-
-  // Click on blank map → reverse geocode
-  map.on('click', async (e) => {
-    if (activePopup) return; // ignore if popup already open
-    const { lat, lng } = e.latlng;
-    try {
-      const res = await fetch(
-        `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`,
-        { headers: { 'Accept-Language': 'fr' } }
-      );
-      const data = await res.json();
-      const road = data.address && (data.address.road || data.address.pedestrian || data.address.footway);
-      if (road) {
-        const key = road.toLowerCase();
-        if (polylineMap[key]) {
-          openPopupForStreet(key, e.latlng);
-        }
-      }
-    } catch(err) { /* ignore */ }
-  });
+  map.on('click', onMapClick);
+  map.on('dblclick', onMapDblClick);
 }
 
-// ─── Polyline helpers ─────────────────────────────────────────────────────────
-function styleForStreet(streetName) {
-  const seg = segments[streetName];
-  if (seg && visibleCircuits.has(seg.circuit)) {
-    return { color: getColor(seg.circuit), weight: 5, opacity: 0.85 };
-  } else if (seg && !visibleCircuits.has(seg.circuit)) {
-    return { color: getColor(seg.circuit), weight: 5, opacity: 0.2 };
-  }
-  return { color: '#555', weight: 3, opacity: 0.45 };
+function onMapClick(e){
+  if(!drawMode) return;
+  drawPoints.push([e.latlng.lat, e.latlng.lng]);
+  updateDrawPreview();
 }
 
-function buildAllPolylines() {
-  layerUnassigned.clearLayers();
-  layerAssigned.clearLayers();
-  polylineMap = {};
-
-  const streetNames = Object.keys(streets);
-  streetNames.forEach(streetName => {
-    const coords = streets[streetName];
-    if (!coords || coords.length === 0) return;
-
-    const style = styleForStreet(streetName);
-    const pline = L.polyline(coords, style);
-
-    // Hover
-    pline.on('mouseover', function(e) {
-      if (this === highlightedPolyline) return;
-      const s = styleForStreet(streetName);
-      this.setStyle({ weight: s.weight + 2, opacity: 1.0 });
-      this.bindTooltip(capitalize(streetName), { sticky: true, className: 'street-tooltip' }).openTooltip(e.latlng);
-    });
-    pline.on('mouseout', function() {
-      if (this === highlightedPolyline) return;
-      this.setStyle(styleForStreet(streetName));
-      this.unbindTooltip();
-    });
-    pline.on('click', function(e) {
-      L.DomEvent.stopPropagation(e);
-      openPopupForStreet(streetName, e.latlng);
-    });
-
-    polylineMap[streetName] = pline;
-    const seg = segments[streetName];
-    if (seg) {
-      layerAssigned.addLayer(pline);
-    } else {
-      layerUnassigned.addLayer(pline);
-    }
-  });
+function onMapDblClick(e){
+  if(!drawMode) return;
+  L.DomEvent.stopPropagation(e);
+  // Remove last point added by the click that preceded dblclick
+  if(drawPoints.length > 1) drawPoints.pop();
+  finishDraw();
 }
 
-function refreshPolylineStyle(streetName) {
-  const pline = polylineMap[streetName];
-  if (!pline) return;
-  const style = styleForStreet(streetName);
-  pline.setStyle(style);
-
-  const seg = segments[streetName];
-  // Move between layer groups
-  if (seg) {
-    layerUnassigned.removeLayer(pline);
-    if (!layerAssigned.hasLayer(pline)) layerAssigned.addLayer(pline);
+function updateDrawPreview(){
+  const pts = drawPoints.map(p => L.latLng(p[0], p[1]));
+  if(drawPolyline){
+    drawPolyline.setLatLngs(pts);
   } else {
-    layerAssigned.removeLayer(pline);
-    if (!layerUnassigned.hasLayer(pline)) layerUnassigned.addLayer(pline);
+    drawPolyline = L.polyline(pts, {color:'#f59e0b', weight:4, dashArray:'8 5'}).addTo(map);
   }
+  // Vertex dots
+  drawDotMarkers.forEach(m=>m.remove());
+  drawDotMarkers = [];
+  drawPoints.forEach(p => {
+    const m = L.circleMarker([p[0],p[1]],{radius:5,color:'#fff',fillColor:'#f59e0b',fillOpacity:1,weight:2}).addTo(map);
+    drawDotMarkers.push(m);
+  });
 }
 
-// ─── Popup ────────────────────────────────────────────────────────────────────
-function openPopupForStreet(streetName, latlng) {
-  if (activePopup) { activePopup.remove(); activePopup = null; }
-
-  // Highlight
-  if (highlightedPolyline) {
-    const prev = Object.keys(polylineMap).find(k => polylineMap[k] === highlightedPolyline);
-    if (prev) highlightedPolyline.setStyle(styleForStreet(prev));
-  }
-  const pline = polylineMap[streetName];
-  if (pline) {
-    const s = styleForStreet(streetName);
-    pline.setStyle({ weight: s.weight + 3, opacity: 1.0 });
-    highlightedPolyline = pline;
-  }
-
-  const seg = segments[streetName] || {};
-  const circuitOptions = circuits.map(c =>
-    `<option value="${c}" ${seg.circuit===c?'selected':''}>${c}</option>`
-  ).join('');
-
-  const content = document.createElement('div');
-  content.className = 'street-popup';
-  content.innerHTML = `
-    <h3>${capitalize(streetName)}</h3>
-    <label>Circuit</label>
-    <select id="popup-circuit">${circuitOptions}</select>
-    <label>Nb colis</label>
-    <input type="number" id="popup-nb" min="0" value="${seg.nb_colis||''}" placeholder="—"/>
-    <div class="popup-btns">
-      <button class="btn-assign" id="popup-assign">✓ Assigner</button>
-      ${seg.circuit ? '<button class="btn-unassign" id="popup-unassign">✕ Désassigner</button>' : ''}
-    </div>
-  `;
-
-  // Stop popup close when clicking inside
-  L.DomEvent.disableClickPropagation(content);
-
-  const popup = L.popup({ closeButton: true, autoClose: false, closeOnClick: false, maxWidth: 300 })
-    .setLatLng(latlng)
-    .setContent(content)
-    .openOn(map);
-
-  activePopup = popup;
-
-  map.once('popupclose', () => {
-    activePopup = null;
-    if (highlightedPolyline) {
-      const prev = Object.keys(polylineMap).find(k => polylineMap[k] === highlightedPolyline);
-      if (prev) highlightedPolyline.setStyle(styleForStreet(prev));
-      highlightedPolyline = null;
-    }
-  });
-
-  content.querySelector('#popup-assign').addEventListener('click', async () => {
-    const circuit = content.querySelector('#popup-circuit').value;
-    const nbVal   = content.querySelector('#popup-nb').value;
-    const body = { rue: streetName, circuit };
-    if (nbVal !== '') body.nb_colis = parseInt(nbVal);
-    const res = await fetch('/api/assign', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-    const data = await res.json();
-    segments = data.segments;
-    refreshPolylineStyle(streetName);
-    renderSidebar();
-    popup.remove(); activePopup = null;
-    highlightedPolyline = null;
-  });
-
-  const unBtn = content.querySelector('#popup-unassign');
-  if (unBtn) {
-    unBtn.addEventListener('click', async () => {
-      const res = await fetch('/api/unassign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rue: streetName })
-      });
-      const data = await res.json();
-      segments = data.segments;
-      refreshPolylineStyle(streetName);
-      renderSidebar();
-      popup.remove(); activePopup = null;
-      highlightedPolyline = null;
-    });
-  }
+function clearDraw(){
+  if(drawPolyline){ drawPolyline.remove(); drawPolyline=null; }
+  drawDotMarkers.forEach(m=>m.remove());
+  drawDotMarkers=[];
+  drawPoints=[];
 }
 
-// ─── Sidebar rendering ────────────────────────────────────────────────────────
-function renderFilters() {
+// ─── Draw mode toggle ─────────────────────────────────────────────────────────
+document.getElementById('btn-draw').addEventListener('click', ()=>{
+  if(drawMode){ cancelDraw(); } else { startDraw(); }
+});
+document.getElementById('btn-finish').addEventListener('click', finishDraw);
+document.getElementById('btn-cancel-draw').addEventListener('click', cancelDraw);
+
+function startDraw(){
+  drawMode = true;
+  drawPoints = [];
+  document.getElementById('btn-draw').textContent = '⬛ Arrêter';
+  document.getElementById('btn-draw').classList.add('active');
+  document.getElementById('btn-finish').style.display = '';
+  document.getElementById('btn-cancel-draw').style.display = '';
+  document.getElementById('draw-hint').style.display = '';
+  map.getContainer().style.cursor = 'crosshair';
+}
+
+function cancelDraw(){
+  drawMode = false;
+  clearDraw();
+  document.getElementById('btn-draw').textContent = '✏ Tracer un segment';
+  document.getElementById('btn-draw').classList.remove('active');
+  document.getElementById('btn-finish').style.display = 'none';
+  document.getElementById('btn-cancel-draw').style.display = 'none';
+  document.getElementById('draw-hint').style.display = 'none';
+  map.getContainer().style.cursor = '';
+}
+
+async function finishDraw(){
+  if(drawPoints.length < 2){
+    alert('Tracez au moins 2 points pour définir un segment.');
+    return;
+  }
+  const coords = [...drawPoints];
+  cancelDraw();  // exit draw mode but keep coords
+  openCreateModal(coords);
+}
+
+// ─── Modal ────────────────────────────────────────────────────────────────────
+function openCreateModal(coords){
+  modalMode   = 'create';
+  modalKey    = null;
+  modalCoords = coords;
+  modalAddresses = [];
+
+  document.getElementById('modal-title').textContent = 'Nouveau segment';
+  document.getElementById('modal-street').value = '';
+  document.getElementById('modal-nb').value = '';
+  document.getElementById('modal-delete').style.display = 'none';
+  document.getElementById('modal-hn-list').innerHTML = '<em style="color:var(--text2)">Détection en cours…</em>';
+  document.getElementById('modal-count').textContent = '';
+  fillCircuitSelect('');
+  document.getElementById('modal-loading').style.display = '';
+  showModal();
+
+  // Detect addresses async
+  fetch('/api/detect_addresses',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({coordinates: coords})
+  }).then(r=>r.json()).then(data=>{
+    document.getElementById('modal-loading').style.display = 'none';
+    modalAddresses = data.addresses || [];
+    if(data.street_name && !document.getElementById('modal-street').value)
+      document.getElementById('modal-street').value = data.street_name;
+    // Estimate nb_colis
+    if(!document.getElementById('modal-nb').value && modalAddresses.length)
+      document.getElementById('modal-nb').value = modalAddresses.length;
+    renderHNList(modalAddresses);
+  }).catch(()=>{
+    document.getElementById('modal-loading').style.display = 'none';
+    renderHNList([]);
+  });
+}
+
+function openEditModal(key){
+  const seg = segments[key];
+  if(!seg) return;
+  modalMode = 'edit';
+  modalKey  = key;
+  modalCoords = seg.coordinates || [];
+  modalAddresses = (seg.house_numbers||[]).map(n=>({housenumber:n,street:seg.street_name||''}));
+
+  document.getElementById('modal-title').textContent = 'Modifier le segment';
+  document.getElementById('modal-street').value = seg.street_name || '';
+  document.getElementById('modal-nb').value = seg.nb_colis || '';
+  document.getElementById('modal-delete').style.display = '';
+  document.getElementById('modal-loading').style.display = 'none';
+  fillCircuitSelect(seg.circuit);
+  renderHNList(modalAddresses);
+  showModal();
+}
+
+function fillCircuitSelect(selected){
+  const sel = document.getElementById('modal-circuit');
+  sel.innerHTML = circuits.map(c=>`<option value="${c}"${c===selected?' selected':''}>${c}</option>`).join('');
+}
+
+function renderHNList(addresses){
+  const box = document.getElementById('modal-hn-list');
+  if(!addresses.length){
+    box.innerHTML = '<em style="color:var(--text2)">Aucun numéro détecté</em>';
+    document.getElementById('modal-count').textContent = '';
+    return;
+  }
+  box.innerHTML = addresses.map(a=>`<span class="hn-tag">${a.housenumber}</span>`).join('');
+  document.getElementById('modal-count').textContent =
+    `${addresses.length} adresse(s) détectée(s)`;
+}
+
+function showModal(){ document.getElementById('modal-overlay').classList.add('show'); }
+function hideModal(){ document.getElementById('modal-overlay').classList.remove('show'); }
+
+document.getElementById('modal-cancel').addEventListener('click', hideModal);
+document.getElementById('modal-overlay').addEventListener('click', e=>{
+  if(e.target===document.getElementById('modal-overlay')) hideModal();
+});
+
+document.getElementById('modal-save').addEventListener('click', async ()=>{
+  const circuit    = document.getElementById('modal-circuit').value;
+  const street_name= document.getElementById('modal-street').value.trim();
+  const nb         = document.getElementById('modal-nb').value;
+  const house_numbers = modalAddresses.map(a=>a.housenumber);
+
+  const body = {
+    circuit, street_name,
+    coordinates: modalCoords,
+    house_numbers,
+  };
+  if(nb !== '') body.nb_colis = parseInt(nb)||0;
+  if(modalMode==='edit' && modalKey) body.key = modalKey;
+
+  const res = await fetch('/api/assign',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(body)
+  });
+  const data = await res.json();
+  segments = data.segments;
+  // Re-draw the assigned segment on map
+  const key = data.key || modalKey;
+  if(segmentLayers[key]) removeSegmentLayer(key);
+  drawSegmentOnMap(key, segments[key]);
+  renderSidebar();
+  hideModal();
+});
+
+document.getElementById('modal-delete').addEventListener('click', async ()=>{
+  if(!modalKey) return;
+  if(!confirm('Supprimer ce segment ?')) return;
+  const res = await fetch('/api/unassign',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({key:modalKey})
+  });
+  const data = await res.json();
+  segments = data.segments;
+  removeSegmentLayer(modalKey);
+  renderSidebar();
+  hideModal();
+});
+
+// ─── Segment map rendering ────────────────────────────────────────────────────
+function drawSegmentOnMap(key, seg){
+  if(!seg || !seg.coordinates || seg.coordinates.length < 2) return;
+  const col = getColor(seg.circuit);
+  const visible = visibleCircuits.has(seg.circuit);
+
+  const pline = L.polyline(seg.coordinates.map(c=>L.latLng(c[0],c[1])),{
+    color: col, weight:5, opacity: visible ? 0.9 : 0.2
+  }).addTo(map);
+
+  // Hover
+  pline.on('mouseover', function(){
+    this.setStyle({weight:8,opacity:1});
+    const name = seg.street_name ? capitalize(seg.street_name) : key;
+    this.bindTooltip(name,{sticky:true}).openTooltip();
+  });
+  pline.on('mouseout', function(){
+    this.setStyle({weight:5,opacity: visibleCircuits.has(seg.circuit)?0.9:0.2});
+    this.unbindTooltip();
+  });
+  pline.on('click', function(e){
+    L.DomEvent.stopPropagation(e);
+    openEditModal(key);
+  });
+
+  // Address markers
+  const addrMarkers = [];
+  (seg.house_numbers||[]).forEach((hn, i) => {
+    // We stored lat/lon in addresses during creation, but may not have them anymore.
+    // So just show addresses on the polyline midpoints if no coords.
+  });
+
+  segmentLayers[key] = { pline, addrMarkers };
+}
+
+function removeSegmentLayer(key){
+  const layer = segmentLayers[key];
+  if(!layer) return;
+  layer.pline.remove();
+  layer.addrMarkers.forEach(m=>m.remove());
+  delete segmentLayers[key];
+}
+
+function rebuildAllSegments(){
+  Object.keys(segmentLayers).forEach(removeSegmentLayer);
+  Object.entries(segments).forEach(([key, seg]) => drawSegmentOnMap(key, seg));
+}
+
+// ─── Sidebar ──────────────────────────────────────────────────────────────────
+function renderFilters(){
   const container = document.getElementById('circuit-filters');
-  // Clear all except add button
   const addBtn = document.getElementById('add-circuit-btn');
   container.innerHTML = '';
 
   circuits.forEach(c => {
     const col = getColor(c);
+    const txt = contrastColor(col);
     const btn = document.createElement('button');
-    btn.className = 'filter-btn' + (visibleCircuits.has(c) ? '' : ' inactive');
+    btn.className = 'filter-btn' + (visibleCircuits.has(c)?'':' off');
     btn.style.background = col;
-    btn.style.color = contrastColor(col);
-    btn.dataset.circuit = c;
-    btn.innerHTML = `
-      <span class="circuit-label">${c}</span>
-      <span class="color-dot" title="Changer couleur" data-circuit="${c}">🎨</span>
-      <span class="del-btn" title="Supprimer ce circuit" data-circuit="${c}">✕</span>
-    `;
-    btn.querySelector('.circuit-label').addEventListener('click', () => toggleCircuit(c));
-    btn.querySelector('.color-dot').addEventListener('click', (e) => {
-      e.stopPropagation();
-      openColorPicker(c, btn);
-    });
-    btn.querySelector('.del-btn').addEventListener('click', (e) => {
-      e.stopPropagation();
-      deleteCircuit(c);
-    });
+    btn.style.color = txt;
+    btn.innerHTML =
+      `<span class="lbl" data-c="${c}">${c}</span>` +
+      `<span class="ico" title="Couleur" data-col="${c}">🎨</span>` +
+      `<span class="ico" title="Supprimer" data-del="${c}">✕</span>`;
+    btn.querySelector('[data-c]').addEventListener('click', ()=>toggleCircuit(c));
+    btn.querySelector('[data-col]').addEventListener('click', e=>{ e.stopPropagation(); openColorPicker(c,btn); });
+    btn.querySelector('[data-del]').addEventListener('click', e=>{ e.stopPropagation(); deleteCircuit(c); });
     container.appendChild(btn);
   });
-
   container.appendChild(addBtn);
 
-  // Export row
-  const exportRow = document.getElementById('export-row');
-  // Remove old export btns
-  exportRow.querySelectorAll('.circuit-export-btn').forEach(b => b.remove());
-  const label = exportRow.querySelector('label');
-  circuits.forEach(c => {
+  // Export buttons
+  const row = document.getElementById('export-row');
+  row.querySelectorAll('.exp-btn').forEach(b=>b.remove());
+  const lbl = row.querySelector('.row-lbl');
+  circuits.forEach(c=>{
     const col = getColor(c);
     const btn = document.createElement('button');
-    btn.className = 'circuit-export-btn';
+    btn.className = 'exp-btn';
     btn.style.background = col;
     btn.style.color = contrastColor(col);
     btn.textContent = c;
     btn.title = `Exporter circuit ${c}`;
-    btn.addEventListener('click', () => {
-      window.location.href = `/api/export_circuit/${encodeURIComponent(c)}`;
-    });
-    exportRow.insertBefore(btn, label.nextSibling);
+    btn.addEventListener('click', ()=>{ window.location.href=`/api/export_circuit/${encodeURIComponent(c)}`; });
+    row.insertBefore(btn, lbl.nextSibling);
   });
 }
 
-function renderStreetList() {
-  const query = document.getElementById('search-input').value.toLowerCase();
+function renderStreetList(){
+  const q = document.getElementById('search-input').value.toLowerCase();
   const container = document.getElementById('street-list');
   container.innerHTML = '';
 
-  // Group assigned streets by circuit
-  const byCircuit = {};
-  circuits.forEach(c => { byCircuit[c] = []; });
+  const byC = {};
+  circuits.forEach(c=>{ byC[c]=[]; });
 
-  Object.entries(segments).forEach(([rue, info]) => {
-    if (!byCircuit[info.circuit]) byCircuit[info.circuit] = [];
-    if (!query || rue.includes(query)) {
-      byCircuit[info.circuit].push({ rue, info });
-    }
+  Object.entries(segments).forEach(([key, info])=>{
+    const name = info.street_name || key;
+    if(!byC[info.circuit]) byC[info.circuit]=[];
+    if(!q || name.toLowerCase().includes(q))
+      byC[info.circuit].push({key, info, name});
   });
 
-  let total = 0;
-  circuits.forEach(c => {
-    const items = (byCircuit[c] || []).sort((a,b) => a.rue.localeCompare(b.rue));
-    items.forEach(({ rue, info }) => {
-      total++;
+  circuits.forEach(c=>{
+    (byC[c]||[]).sort((a,b)=>a.name.localeCompare(b.name)).forEach(({key,info,name})=>{
       const col = getColor(c);
       const div = document.createElement('div');
-      div.className = 'street-item';
+      div.className = 'seg-item';
       div.style.borderLeftColor = col;
-      div.innerHTML = `
-        <span class="circuit-badge" style="background:${col};color:${contrastColor(col)}">${c}</span>
-        <span class="rue-name" title="${capitalize(rue)}">${capitalize(rue)}</span>
-        ${info.nb_colis ? `<span class="nb-colis">${info.nb_colis}📦</span>` : ''}
-      `;
-      div.addEventListener('click', () => zoomToStreet(rue));
+      const nb = info.nb_colis;
+      const hn = (info.house_numbers||[]).length;
+      div.innerHTML =
+        `<span class="seg-badge" style="background:${col};color:${contrastColor(col)}">${c}</span>` +
+        `<span class="seg-name" title="${capitalize(name)}">${capitalize(name)}</span>` +
+        `<span class="seg-meta">${nb?nb+'📦':''}${hn?' '+hn+'🏠':''}</span>`;
+      div.addEventListener('click', ()=>zoomToSegment(key));
       container.appendChild(div);
     });
   });
 
-  document.getElementById('stats').textContent =
-    `${Object.keys(segments).length} rue(s) assignée(s) · ${Object.keys(streets).length} rues totales`;
+  const total = Object.keys(segments).length;
+  const totalColis = Object.values(segments).reduce((s,i)=>s+(i.nb_colis||0),0);
+  document.getElementById('sb-stats').textContent =
+    `${total} segment(s) · ${totalColis} colis estimés`;
 }
 
-function renderSidebar() {
-  renderFilters();
-  renderStreetList();
-}
+function renderSidebar(){ renderFilters(); renderStreetList(); }
 
 // ─── Actions ──────────────────────────────────────────────────────────────────
-function toggleCircuit(c) {
-  if (visibleCircuits.has(c)) visibleCircuits.delete(c);
+function toggleCircuit(c){
+  if(visibleCircuits.has(c)) visibleCircuits.delete(c);
   else visibleCircuits.add(c);
-  // Refresh styles for all streets of this circuit
-  Object.keys(segments).forEach(rue => {
-    if (segments[rue].circuit === c) refreshPolylineStyle(rue);
+  // Update opacity for this circuit
+  Object.entries(segmentLayers).forEach(([key, layer])=>{
+    if(segments[key] && segments[key].circuit===c){
+      layer.pline.setStyle({opacity: visibleCircuits.has(c)?0.9:0.2});
+    }
   });
   renderSidebar();
 }
 
-function zoomToStreet(streetName) {
-  const pline = polylineMap[streetName];
-  if (pline) {
-    map.fitBounds(pline.getBounds(), { padding: [40, 40], maxZoom: 17 });
-    const center = pline.getBounds().getCenter();
-    openPopupForStreet(streetName, center);
+function zoomToSegment(key){
+  const layer = segmentLayers[key];
+  if(layer){
+    map.fitBounds(layer.pline.getBounds(),{padding:[60,60],maxZoom:18});
+    openEditModal(key);
   }
 }
 
-function openColorPicker(circuit, btnEl) {
-  let picker = document.getElementById('hidden-color-picker');
-  if (!picker) {
-    picker = document.createElement('input');
-    picker.type = 'color';
-    picker.id = 'hidden-color-picker';
-    picker.className = 'hidden-picker';
-    document.body.appendChild(picker);
-  }
-  picker.value = getColor(circuit);
-  picker.style.position = 'fixed';
-  picker.style.left = '-9999px';
-  picker.click();
-  picker.oninput = null;
-  picker.onchange = async function() {
-    const color = picker.value;
-    await fetch('/api/update_color', {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({ circuit, color })
-    });
+function openColorPicker(circuit, btnEl){
+  let p = document.getElementById('_cp');
+  if(!p){ p=document.createElement('input');p.type='color';p.id='_cp';p.style.cssText='position:fixed;left:-999px;opacity:0';document.body.appendChild(p); }
+  p.value = getColor(circuit);
+  p.click();
+  p.onchange = async ()=>{
+    const color = p.value;
+    await fetch('/api/update_color',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({circuit,color})});
     colors[circuit] = color;
-    // Refresh polylines
-    Object.keys(segments).forEach(rue => {
-      if (segments[rue].circuit === circuit) refreshPolylineStyle(rue);
+    Object.entries(segmentLayers).forEach(([key,layer])=>{
+      if(segments[key]&&segments[key].circuit===circuit) layer.pline.setStyle({color});
     });
     renderSidebar();
   };
 }
 
-async function deleteCircuit(c) {
-  if (!confirm(`Supprimer le circuit ${c} ? Toutes les rues assignées à ce circuit seront désassignées.`)) return;
-  const res = await fetch('/api/delete_circuit', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ name: c })
-  });
+async function deleteCircuit(c){
+  if(!confirm(`Supprimer le circuit ${c} et tous ses segments ?`)) return;
+  const res = await fetch('/api/delete_circuit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:c})});
   const cfg = await res.json();
-  circuits = cfg.circuits;
-  colors = cfg.colors;
-  // Reload segments
-  const dres = await fetch('/api/data');
-  const d = await dres.json();
+  circuits = cfg.circuits; colors = cfg.colors;
+  const rd = await fetch('/api/data'); const d = await rd.json();
   segments = d.segments;
   visibleCircuits = new Set(circuits);
-  buildAllPolylines();
+  rebuildAllSegments();
   renderSidebar();
 }
 
-document.getElementById('add-circuit-btn').addEventListener('click', async () => {
-  const name = prompt('Nom du nouveau circuit (ex: 549) :');
-  if (!name || !name.trim()) return;
-  const color = prompt('Couleur hexadécimale (ex: #ff5500) :', '#888888');
-  const res = await fetch('/api/add_circuit', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ name: name.trim(), color: color || '#888888' })
-  });
+document.getElementById('add-circuit-btn').addEventListener('click', async ()=>{
+  const name = prompt('Nom du circuit (ex: 549) :');
+  if(!name||!name.trim()) return;
+  const color = prompt('Couleur hexadécimale :', '#888888');
+  const res = await fetch('/api/add_circuit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name.trim(),color:color||'#888888'})});
   const cfg = await res.json();
-  circuits = cfg.circuits;
-  colors = cfg.colors;
+  circuits=cfg.circuits; colors=cfg.colors;
   visibleCircuits.add(name.trim());
   renderSidebar();
 });
 
-document.getElementById('refresh-streets-btn').addEventListener('click', async () => {
-  if (!confirm('Recharger toutes les rues depuis OpenStreetMap ? (peut prendre 30s)')) return;
-  showLoading('Chargement des rues depuis OpenStreetMap…');
-  try {
-    const res = await fetch('/api/streets?force=1');
-    const data = await res.json();
-    if (data.streets) {
-      streets = data.streets;
-      buildAllPolylines();
-      renderSidebar();
-    }
-    if (data.warning) alert('Avertissement : ' + data.warning);
-  } catch(e) {
-    alert('Erreur lors du chargement : ' + e.message);
-  } finally {
-    hideLoading();
-  }
-});
-
-document.getElementById('import-btn').addEventListener('click', () => {
-  document.getElementById('csv-file-input').click();
-});
-
-document.getElementById('csv-file-input').addEventListener('change', async function() {
-  const file = this.files[0];
-  if (!file) return;
-  const formData = new FormData();
-  formData.append('file', file);
-  showLoading('Import CSV en cours…');
-  try {
-    const res = await fetch('/api/import_csv', { method: 'POST', body: formData });
-    const data = await res.json();
-    segments = data.segments;
-    buildAllPolylines();
-    renderSidebar();
-    alert(`Import terminé : ${data.imported} rue(s) importée(s).${data.errors.length ? '\nErreurs : ' + data.errors.join(', ') : ''}`);
-  } catch(e) {
-    alert('Erreur import : ' + e.message);
-  } finally {
-    hideLoading();
-    this.value = '';
-  }
+document.getElementById('import-btn').addEventListener('click', ()=>document.getElementById('csv-file-input').click());
+document.getElementById('csv-file-input').addEventListener('change', async function(){
+  const file=this.files[0]; if(!file) return;
+  const fd=new FormData(); fd.append('file',file);
+  const res = await fetch('/api/import_csv',{method:'POST',body:fd});
+  const data = await res.json();
+  segments=data.segments; rebuildAllSegments(); renderSidebar();
+  alert(`Import : ${data.imported} segment(s) importé(s).`);
+  this.value='';
 });
 
 document.getElementById('search-input').addEventListener('input', renderStreetList);
 
 // ─── Boot ─────────────────────────────────────────────────────────────────────
-async function boot() {
-  showLoading('Initialisation de la carte…');
+async function boot(){
   initMap();
-
-  // Load config + segments
-  const dres = await fetch('/api/data');
-  const d = await dres.json();
-  segments = d.segments;
-  circuits = d.circuits;
-  colors   = d.colors;
+  const res = await fetch('/api/data');
+  const d = await res.json();
+  segments=d.segments; circuits=d.circuits; colors=d.colors;
   visibleCircuits = new Set(circuits);
-
+  rebuildAllSegments();
   renderSidebar();
-
-  // Load streets
-  showLoading('Chargement des rues (cache ou OpenStreetMap)…');
-  try {
-    const sres = await fetch('/api/streets');
-    const sdata = await sres.json();
-    if (sdata.error && !sdata.streets) {
-      alert('Impossible de charger les rues : ' + sdata.error);
-    } else {
-      streets = sdata.streets || {};
-      if (sdata.warning) {
-        console.warn('Streets warning:', sdata.warning);
-      }
-    }
-  } catch(e) {
-    alert('Erreur réseau lors du chargement des rues : ' + e.message);
-  }
-
-  buildAllPolylines();
-  renderSidebar();
-  hideLoading();
 }
-
 boot();
 </script>
 </body>
