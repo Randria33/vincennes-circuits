@@ -64,18 +64,19 @@ def save_circuits_config(cfg):
         json.dump(cfg, f, ensure_ascii=False, indent=2)
 
 def point_to_segment_dist(px, py, ax, ay, bx, by):
-    """Distance in meters from point to segment (approximate, flat earth)."""
+    """Distance in meters from point (lat,lon) to segment. Correct lat/lon scaling."""
     lat_m = 111320.0
     lon_m = 111320.0 * math.cos(math.radians((ax + bx) / 2.0))
-    dx = (bx - ax) * lon_m
-    dy = (by - ay) * lat_m
-    if dx == 0 and dy == 0:
-        return math.hypot((px - ax) * lon_m, (py - ay) * lat_m)
-    t = ((px - ax) * lon_m * dx + (py - ay) * lat_m * dy) / (dx * dx + dy * dy)
+    # segment vector in metres (lat=x, lon=y)
+    dlat = (bx - ax) * lat_m
+    dlon = (by - ay) * lon_m
+    if dlat == 0 and dlon == 0:
+        return math.hypot((px - ax) * lat_m, (py - ay) * lon_m)
+    t = ((px - ax) * lat_m * dlat + (py - ay) * lon_m * dlon) / (dlat * dlat + dlon * dlon)
     t = max(0.0, min(1.0, t))
     nx = ax + t * (bx - ax)
     ny = ay + t * (by - ay)
-    return math.hypot((px - nx) * lon_m, (py - ny) * lat_m)
+    return math.hypot((px - nx) * lat_m, (py - ny) * lon_m)
 
 def is_near_polyline(lat, lon, coords, max_dist=50):
     if len(coords) == 1:
@@ -114,7 +115,7 @@ def api_detect_addresses():
 
     lats = [c[0] for c in coords]
     lons = [c[1] for c in coords]
-    pad = 0.001
+    pad = 0.0003   # ~33m padding around the drawn line bbox
     s, w, n, e = min(lats)-pad, min(lons)-pad, max(lats)+pad, max(lons)+pad
 
     # In France, addresses are often on building ways (not nodes) → include both
@@ -157,15 +158,25 @@ out center;"""
         highway_name = tags.get('name', '').strip()
 
         if num and lat is not None and lon is not None:
-            if is_near_polyline(lat, lon, coords, 60):
+            if is_near_polyline(lat, lon, coords, 20):   # 20m = buildings on drawn street only
                 addresses.append({'housenumber': num, 'street': street, 'lat': lat, 'lon': lon})
                 if street:
                     street_votes[street] = street_votes.get(street, 0) + 1
 
         elif highway_name and t == 'way' and lat is not None:
-            # Way is a street → vote for street name
-            if is_near_polyline(lat, lon, coords, 80):
+            if is_near_polyline(lat, lon, coords, 30):
                 street_votes[highway_name] = street_votes.get(highway_name, 0) + 1
+
+    # Deduplicate: same housenumber at approximately same position (node + way both in OSM)
+    seen = set()
+    unique = []
+    for a in addresses:
+        # Key = number + position rounded to ~11m
+        dedup_key = (a['housenumber'], round(a['lat'], 4), round(a['lon'], 4))
+        if dedup_key not in seen:
+            seen.add(dedup_key)
+            unique.append(a)
+    addresses = unique
 
     # Sort house numbers naturally
     def hn_sort(a):
@@ -254,6 +265,30 @@ def api_export_circuit(circuit):
         content,
         mimetype='text/plain',
         headers={'Content-Disposition': f'attachment; filename="circuit_{circuit}.txt"'}
+    )
+
+@app.route('/api/export_all')
+def api_export_all():
+    segments = load_segments()
+    cfg = load_circuits_config()
+    circuits_order = cfg.get('circuits', [])
+
+    output = io.StringIO()
+    writer = csv.writer(output, delimiter=';')
+    writer.writerow(['Circuit', 'Rue', 'Numeros', 'Nb_colis'])
+    for c in circuits_order:
+        for key, info in sorted(segments.items(), key=lambda x: x[1].get('street_name', '')):
+            if info.get('circuit') != c:
+                continue
+            hn = ', '.join(info.get('house_numbers', []))
+            nb = info.get('nb_colis', '')
+            writer.writerow([c, info.get('street_name', ''), hn, nb])
+
+    content = output.getvalue()
+    return Response(
+        content.encode('utf-8-sig'),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename="circuits_vincennes.csv"'}
     )
 
 @app.route('/api/import_csv', methods=['POST'])
@@ -386,6 +421,8 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',sans-serif;backgrou
 .seg-badge{font-size:10px;font-weight:700;padding:2px 5px;border-radius:3px;white-space:nowrap}
 .seg-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .seg-meta{font-size:11px;color:var(--text2);white-space:nowrap}
+.seg-del{font-size:13px;opacity:0.3;cursor:pointer;padding:0 2px;flex-shrink:0}
+.seg-del:hover{opacity:1}
 #export-row{padding:8px 12px;border-top:1px solid var(--border);display:flex;flex-wrap:wrap;gap:4px;align-items:center}
 #export-row .row-lbl{font-size:10px;color:var(--text2);width:100%;margin-bottom:2px}
 .exp-btn{padding:5px 9px;border:none;border-radius:4px;cursor:pointer;font-weight:700;font-size:11px}
@@ -413,16 +450,16 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',sans-serif;backgrou
 #btn-draw{background:#4f8ef7;color:#fff}
 #btn-draw:hover{background:#2e70e0}
 #btn-draw.active{background:#f59e0b;color:#fff}
-#btn-finish{background:var(--success);color:#fff;display:none}
+#btn-finish{background:var(--success);color:#fff}
 #btn-finish:hover{filter:brightness(1.1)}
-#btn-cancel-draw{background:#e5e7eb;color:#333;display:none}
+#btn-cancel-draw{background:#e5e7eb;color:#333}
 #btn-cancel-draw:hover{background:#d1d5db}
 #draw-hint{
   position:absolute;bottom:30px;left:50%;transform:translateX(-50%);
   z-index:500;
   background:rgba(0,0,0,.7);color:#fff;
   padding:7px 14px;border-radius:20px;
-  font-size:12px;display:none;pointer-events:none;
+  font-size:12px;pointer-events:none;
 }
 
 /* ── Modal ── */
@@ -446,8 +483,23 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',sans-serif;backgrou
   display:flex;flex-wrap:wrap;gap:4px;
 }
 .hn-tag{
+  display:inline-flex;align-items:center;gap:3px;
   background:var(--bg3);border:1px solid var(--border);border-radius:3px;
-  padding:2px 6px;font-size:11px;color:var(--text);
+  padding:2px 5px;font-size:11px;color:var(--text);
+}
+.hn-tag .hn-x{
+  cursor:pointer;color:var(--text2);font-size:10px;line-height:1;
+}
+.hn-tag .hn-x:hover{color:var(--danger)}
+#hn-add-row{display:flex;gap:5px;margin-top:5px}
+#hn-add-input{
+  flex:1;background:var(--bg);border:1px solid var(--border);border-radius:4px;
+  color:var(--text);padding:4px 7px;font-size:12px;outline:none;
+}
+#hn-add-input:focus{border-color:var(--accent)}
+#hn-add-btn{
+  padding:4px 10px;background:var(--accent);border:none;border-radius:4px;
+  color:#fff;cursor:pointer;font-size:12px;font-weight:600;
 }
 #modal-count{font-size:11px;color:var(--text2);margin-top:4px}
 .modal-btns{display:flex;gap:8px;margin-top:16px}
@@ -478,8 +530,12 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',sans-serif;backgrou
     <h3 id="modal-title">Nouveau segment</h3>
     <span class="m-label">Rue</span>
     <input class="m-input" id="modal-street" type="text" placeholder="Nom de la rue…"/>
-    <span class="m-label">Numéros détectés</span>
+    <span class="m-label">Numéros (cliquer ✕ pour supprimer)</span>
     <div id="modal-hn-list"><em style="color:var(--text2)">—</em></div>
+    <div id="hn-add-row">
+      <input id="hn-add-input" type="text" placeholder="Ajouter un n° (ex: 12bis)"/>
+      <button id="hn-add-btn">＋</button>
+    </div>
     <div id="modal-count"></div>
     <span class="m-label">Circuit</span>
     <select class="m-input" id="modal-circuit"></select>
@@ -505,7 +561,8 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',sans-serif;backgrou
     <div id="circuit-filters"><button id="add-circuit-btn">＋ Nouveau circuit</button></div>
     <div id="street-list"></div>
     <div id="export-row">
-      <span class="row-lbl">Exporter :</span>
+      <span class="row-lbl">Exporter par circuit :</span>
+      <button class="act-btn" id="export-all-btn" title="Exporter tous les circuits en CSV">⬇ Tout exporter</button>
       <button class="act-btn" id="import-btn">⬆ Importer CSV</button>
     </div>
   </div>
@@ -515,10 +572,10 @@ html,body{height:100%;overflow:hidden;font-family:'Segoe UI',sans-serif;backgrou
     <div id="map"></div>
     <div id="map-toolbar">
       <button id="btn-draw">✏ Tracer un segment</button>
-      <button id="btn-finish">✓ Terminer le tracé</button>
-      <button id="btn-cancel-draw">✕ Annuler</button>
+      <button id="btn-finish" style="display:none">✓ Terminer le tracé</button>
+      <button id="btn-cancel-draw" style="display:none">✕ Annuler</button>
     </div>
-    <div id="draw-hint">Cliquez pour placer des points · Double-clic ou "Terminer" pour finir</div>
+    <div id="draw-hint" style="display:none">Cliquez · Double-clic ou "Terminer" pour finir</div>
   </div>
 </div>
 
@@ -561,6 +618,9 @@ function initMap(){
 
   map.on('click', onMapClick);
   map.on('dblclick', onMapDblClick);
+
+  // Prevent toolbar clicks from reaching the map
+  L.DomEvent.disableClickPropagation(document.getElementById('map-toolbar'));
 }
 
 function onMapClick(e){
@@ -572,8 +632,9 @@ function onMapClick(e){
 function onMapDblClick(e){
   if(!drawMode) return;
   L.DomEvent.stopPropagation(e);
-  // Remove last point added by the click that preceded dblclick
-  if(drawPoints.length > 1) drawPoints.pop();
+  // A dblclick fires 2 click events first → remove both extra points
+  if(drawPoints.length >= 2) { drawPoints.pop(); drawPoints.pop(); }
+  else { drawPoints = []; }
   finishDraw();
 }
 
@@ -612,9 +673,9 @@ function startDraw(){
   drawPoints = [];
   document.getElementById('btn-draw').textContent = '⬛ Arrêter';
   document.getElementById('btn-draw').classList.add('active');
-  document.getElementById('btn-finish').style.display = '';
-  document.getElementById('btn-cancel-draw').style.display = '';
-  document.getElementById('draw-hint').style.display = '';
+  document.getElementById('btn-finish').style.display = 'inline-block';
+  document.getElementById('btn-cancel-draw').style.display = 'inline-block';
+  document.getElementById('draw-hint').style.display = 'block';
   map.getContainer().style.cursor = 'crosshair';
 }
 
@@ -653,7 +714,7 @@ function openCreateModal(coords){
   document.getElementById('modal-hn-list').innerHTML = '<em style="color:var(--text2)">Détection en cours…</em>';
   document.getElementById('modal-count').textContent = '';
   fillCircuitSelect('');
-  document.getElementById('modal-loading').style.display = '';
+  document.getElementById('modal-loading').style.display = 'block';
   showModal();
 
   // Detect addresses async
@@ -687,7 +748,7 @@ function openEditModal(key){
   document.getElementById('modal-title').textContent = 'Modifier le segment';
   document.getElementById('modal-street').value = seg.street_name || '';
   document.getElementById('modal-nb').value = seg.nb_colis || '';
-  document.getElementById('modal-delete').style.display = '';
+  document.getElementById('modal-delete').style.display = 'inline-block';
   document.getElementById('modal-loading').style.display = 'none';
   fillCircuitSelect(seg.circuit);
   renderHNList(modalAddresses);
@@ -702,13 +763,41 @@ function fillCircuitSelect(selected){
 function renderHNList(addresses){
   const box = document.getElementById('modal-hn-list');
   if(!addresses.length){
-    box.innerHTML = '<em style="color:var(--text2)">Aucun numéro détecté</em>';
+    box.innerHTML = '<em style="color:var(--text2)">Aucun numéro</em>';
     document.getElementById('modal-count').textContent = '';
     return;
   }
-  box.innerHTML = addresses.map(a=>`<span class="hn-tag">${a.housenumber}</span>`).join('');
+  box.innerHTML = '';
+  addresses.forEach((a, i) => {
+    const tag = document.createElement('span');
+    tag.className = 'hn-tag';
+    tag.innerHTML = `${a.housenumber}<span class="hn-x" title="Supprimer">✕</span>`;
+    tag.querySelector('.hn-x').addEventListener('click', ()=>{
+      modalAddresses.splice(i, 1);
+      renderHNList(modalAddresses);
+      // Update nb_colis estimate
+      const nbField = document.getElementById('modal-nb');
+      if(nbField.value == addresses.length) nbField.value = modalAddresses.length;
+    });
+    box.appendChild(tag);
+  });
   document.getElementById('modal-count').textContent =
-    `${addresses.length} adresse(s) détectée(s)`;
+    `${addresses.length} numéro(s)`;
+}
+
+// Add number manually
+document.getElementById('hn-add-btn').addEventListener('click', addHNManual);
+document.getElementById('hn-add-input').addEventListener('keydown', e=>{
+  if(e.key === 'Enter'){ e.preventDefault(); addHNManual(); }
+});
+function addHNManual(){
+  const val = document.getElementById('hn-add-input').value.trim();
+  if(!val) return;
+  modalAddresses.push({housenumber: val, street: '', lat: 0, lon: 0});
+  renderHNList(modalAddresses);
+  document.getElementById('modal-nb').value = modalAddresses.length;
+  document.getElementById('hn-add-input').value = '';
+  document.getElementById('hn-add-input').focus();
 }
 
 function showModal(){ document.getElementById('modal-overlay').classList.add('show'); }
@@ -785,13 +874,19 @@ function drawSegmentOnMap(key, seg){
     L.DomEvent.stopPropagation(e);
     openEditModal(key);
   });
-
-  // Address markers
-  const addrMarkers = [];
-  (seg.house_numbers||[]).forEach((hn, i) => {
-    // We stored lat/lon in addresses during creation, but may not have them anymore.
-    // So just show addresses on the polyline midpoints if no coords.
+  // Right-click → delete directly
+  pline.on('contextmenu', async function(e){
+    L.DomEvent.stopPropagation(e);
+    const name = seg.street_name ? capitalize(seg.street_name) : key;
+    if(!confirm(`Supprimer "${name}" ?`)) return;
+    const res = await fetch('/api/unassign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+    const data = await res.json();
+    segments = data.segments;
+    removeSegmentLayer(key);
+    renderSidebar();
   });
+
+  const addrMarkers = [];
 
   segmentLayers[key] = { pline, addrMarkers };
 }
@@ -876,8 +971,21 @@ function renderStreetList(){
       div.innerHTML =
         `<span class="seg-badge" style="background:${col};color:${contrastColor(col)}">${c}</span>` +
         `<span class="seg-name" title="${capitalize(name)}">${capitalize(name)}</span>` +
-        `<span class="seg-meta">${nb?nb+'📦':''}${hn?' '+hn+'🏠':''}</span>`;
-      div.addEventListener('click', ()=>zoomToSegment(key));
+        `<span class="seg-meta">${nb?nb+'📦':''}${hn?' '+hn+'🏠':''}</span>` +
+        `<span class="seg-del" title="Supprimer" data-key="${key}">🗑</span>`;
+      div.addEventListener('click', e=>{
+        if(e.target.classList.contains('seg-del')) return;
+        zoomToSegment(key);
+      });
+      div.querySelector('.seg-del').addEventListener('click', async e=>{
+        e.stopPropagation();
+        if(!confirm(`Supprimer "${capitalize(name)}" ?`)) return;
+        const res = await fetch('/api/unassign',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key})});
+        const data = await res.json();
+        segments = data.segments;
+        removeSegmentLayer(key);
+        renderSidebar();
+      });
       container.appendChild(div);
     });
   });
@@ -950,6 +1058,7 @@ document.getElementById('add-circuit-btn').addEventListener('click', async ()=>{
   renderSidebar();
 });
 
+document.getElementById('export-all-btn').addEventListener('click', ()=>{ window.location.href='/api/export_all'; });
 document.getElementById('import-btn').addEventListener('click', ()=>document.getElementById('csv-file-input').click());
 document.getElementById('csv-file-input').addEventListener('change', async function(){
   const file=this.files[0]; if(!file) return;
